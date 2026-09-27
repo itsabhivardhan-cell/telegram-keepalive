@@ -1,0 +1,32 @@
+name: Keep Bot Active
+
+on:
+  schedule:
+    # Runs every 5 minutes. GitHub's minimum interval is 5 minutes,
+    # and actual timing can lag a few minutes during busy periods -
+    # that's a GitHub-side limitation, not something we can tune away.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
+jobs:
+  ping-bots:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install telethon
+
+      - name: Send keep-alive messages
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          BOT_USERNAMES: ${{ secrets.BOT_USERNAMES }}
+        run: python keep_bot_active_action.py
