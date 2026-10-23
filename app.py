@@ -1,111 +1,72 @@
-"""
-app.py - Render-compatible version
-------------------------------------
-Runs a tiny web server (so Render's free "Web Service" tier accepts it)
-while a background thread runs the actual Telegram keep-alive loop,
-sending a message every 1 minute exactly - same precision as running
-it locally, but hosted in the cloud for free.
- 
-An external free pinger (e.g. UptimeRobot, cron-job.org) should hit
-this server's URL every ~10 minutes so Render doesn't put it to sleep
-after 15 minutes of no incoming HTTP traffic. The ping only keeps the
-server AWAKE - it does not control the message timing, which is
-handled independently by the background loop below.
- 
-ENV VARS (set these in Render's dashboard under your service's
-"Environment" tab - NOT hardcoded here):
-  API_ID          - your api_id from my.telegram.org
-  API_HASH        - your api_hash from my.telegram.org
-  SESSION_STRING  - from generate_session.py (run locally once)
-  BOT_USERNAMES   - comma-separated, e.g. "bot_one,bot_two"
-  MESSAGE         - optional, defaults to "hi"
-"""
- 
 import asyncio
 import logging
 import os
-import threading
- 
-from flask import Flask
+import sys
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import RPCError
- 
+from telethon.errors import RPCError, FloodWaitError
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("keep_bot_active")
- 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
-BOT_USERNAMES = [b.strip() for b in os.environ["BOT_USERNAMES"].split(",") if b.strip()]
+
+API_ID = int(os.environ["API_ID"].strip())
+API_HASH = os.environ["API_HASH"].strip()
+SESSION_STRING = os.environ["SESSION_STRING"].strip()
+TARGETS = [b.strip() for b in os.environ["BOT_USERNAMES"].split(",") if b.strip()]
 MESSAGE = os.environ.get("MESSAGE", "hi")
-INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "60"))
- 
-GROUP_MESSAGE = os.environ.get("GROUP_MESSAGE", "/group")
-GROUP_INTERVAL_SECONDS = int(os.environ.get("GROUP_INTERVAL_SECONDS", "3600"))  # 1 hour
- 
-app = Flask(__name__)
- 
- 
-@app.route("/")
-def health_check():
-    # This is what the external pinger (UptimeRobot etc.) hits
-    # to keep Render from putting the service to sleep.
-    return "Bot keep-alive service is running.", 200
- 
- 
-async def send_to_all(client: TelegramClient, message: str):
-    for bot in BOT_USERNAMES:
-        username = bot if bot.startswith("@") else f"@{bot}"
+# Set LOOP_SECONDS=300 on Render if this is a Worker; leave unset for Cron Job
+LOOP_SECONDS = int(os.environ.get("LOOP_SECONDS", "0"))
+
+
+def to_target(t):
+    if t.lstrip("-").isdigit():          # numeric chat ID (groups)
+        return int(t)
+    return t if t.startswith("@") else f"@{t}"
+
+
+async def send_all(client):
+    had_error = False
+    for t in TARGETS:
+        target = to_target(t)
         try:
-            await client.send_message(username, message)
-            log.info(f"Sent '{message}' to {username}")
+            await client.send_message(target, MESSAGE)
+            log.info(f"Sent '{MESSAGE}' to {target}")
+        except FloodWaitError as e:
+            log.warning(f"FloodWait {e.seconds}s for {target}")
+            had_error = True
         except RPCError as e:
-            log.warning(f"Telegram error messaging {username}: {e}")
+            log.warning(f"Telegram error messaging {target}: {type(e).__name__}: {e}")
+            had_error = True
         except Exception as e:
-            log.warning(f"Failed to message {username}: {e}")
- 
- 
-async def ping_bots_loop(client: TelegramClient):
-    # Sends MESSAGE ("hi" by default) every INTERVAL_SECONDS (1 min by default)
-    while True:
-        await send_to_all(client, MESSAGE)
-        await asyncio.sleep(INTERVAL_SECONDS)
- 
- 
-async def group_command_loop(client: TelegramClient):
-    # Sends GROUP_MESSAGE ("/group" by default) immediately on first run,
-    # then every GROUP_INTERVAL_SECONDS (1 hour by default) after that.
-    while True:
-        await send_to_all(client, GROUP_MESSAGE)
-        await asyncio.sleep(GROUP_INTERVAL_SECONDS)
- 
- 
-async def telegram_main():
+            log.warning(f"Failed to message {target}: {type(e).__name__}: {e}")
+            had_error = True
+    return had_error
+
+
+async def main():
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    await client.start()
-    log.info("Logged in. Starting keep-alive loops...")
-    try:
-        # Run both loops concurrently, sharing the same logged-in client
-        await asyncio.gather(
-            ping_bots_loop(client),
-            group_command_loop(client),
-        )
-    finally:
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        log.error("SESSION NOT AUTHORIZED. Regenerate SESSION_STRING using the SAME API_ID and API_HASH.")
         await client.disconnect()
- 
- 
-def run_telegram_loop():
-    # Runs the Telegram async loop in its own thread, separate from Flask.
-    asyncio.run(telegram_main())
- 
- 
+        sys.exit(1)
+
+    me = await client.get_me()
+    log.info(f"Logged in as {me.first_name} (@{me.username}) id={me.id}")
+
+    # Loads your dialogs so Telethon can resolve groups the account is in
+    await client.get_dialogs()
+
+    had_error = await send_all(client)
+    while LOOP_SECONDS:
+        await asyncio.sleep(LOOP_SECONDS)
+        had_error = await send_all(client)
+
+    await client.disconnect()
+    if had_error:
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    # Start the Telegram loop in the background, then serve HTTP requests
-    # on the main thread so Render sees a responsive web service.
-    thread = threading.Thread(target=run_telegram_loop, daemon=True)
-    thread.start()
- 
-    port = int(os.environ.get("PORT", 10000))  # Render sets PORT automatically
-    app.run(host="0.0.0.0", port=port)
- 
+    asyncio.run(main())
