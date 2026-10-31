@@ -9,17 +9,17 @@ from telethon.errors import RPCError, FloodWaitError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("keep_bot_active")
 
+# Parse environment variables safely
 API_ID = int(os.environ["API_ID"].strip())
-API_HASH = os.environ["API_HASH"].strip()
-SESSION_STRING = os.environ["SESSION_STRING"].strip()
-TARGETS = [b.strip() for b in os.environ["BOT_USERNAMES"].split(",") if b.strip()]
+API_HASH = os.environ["API_HASH"].strip().strip("\"'")
+SESSION_STRING = os.environ["SESSION_STRING"].strip().strip("\"'")
+TARGETS = [b.strip() for b in os.environ.get("BOT_USERNAMES", "").split(",") if b.strip()]
 MESSAGE = os.environ.get("MESSAGE", "hi")
-# Set LOOP_SECONDS=300 on Render if this is a Worker; leave unset for Cron Job
 LOOP_SECONDS = int(os.environ.get("LOOP_SECONDS", "0"))
 
 
 def to_target(t):
-    if t.lstrip("-").isdigit():          # numeric chat ID (groups)
+    if t.lstrip("-").isdigit():  # numeric chat ID (groups/channels)
         return int(t)
     return t if t.startswith("@") else f"@{t}"
 
@@ -55,16 +55,20 @@ async def main():
     me = await client.get_me()
     log.info(f"Logged in as {me.first_name} (@{me.username}) id={me.id}")
 
-    # Loads your dialogs so Telethon can resolve groups the account is in
+    # Load dialogs so Telethon resolves target entity IDs/usernames accurately
     await client.get_dialogs()
 
     had_error = await send_all(client)
-    while LOOP_SECONDS:
+
+    # If running continuously as a Render Worker (LOOP_SECONDS > 0)
+    while LOOP_SECONDS > 0:
         await asyncio.sleep(LOOP_SECONDS)
         had_error = await send_all(client)
 
     await client.disconnect()
-    if had_error:
+
+    # If running as a Cron Job, exit with code 1 if errors occurred
+    if had_error and LOOP_SECONDS == 0:
         sys.exit(1)
 
 
